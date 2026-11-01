@@ -326,6 +326,7 @@ type TransactionReceiptsQuery ethereum.TransactionReceiptsQuery
 func (args *TransactionReceiptsQuery) UnmarshalJSON(data []byte) error {
 	type input struct {
 		TransactionHashes []common.Hash `json:"transactionHashes"`
+		IncludeRemoved    bool          `json:"includeRemoved"`
 	}
 
 	var raw input
@@ -334,6 +335,7 @@ func (args *TransactionReceiptsQuery) UnmarshalJSON(data []byte) error {
 	}
 
 	args.TransactionHashes = raw.TransactionHashes
+	args.IncludeRemoved = raw.IncludeRemoved
 	return nil
 }
 
@@ -353,13 +355,15 @@ func (api *FilterAPI) TransactionReceipts(ctx context.Context, filter *Transacti
 		rpcSub          = notifier.CreateSubscription()
 		matchedReceipts = make(chan []*ReceiptWithTx)
 		txHashes        []common.Hash
+		includeRemoved  bool
 	)
 
 	if filter != nil {
 		txHashes = filter.TransactionHashes
+		includeRemoved = filter.IncludeRemoved
 	}
 
-	receiptsSub := api.events.SubscribeTransactionReceipts(txHashes, matchedReceipts)
+	receiptsSub := api.events.SubscribeTransactionReceipts(txHashes, includeRemoved, matchedReceipts)
 
 	go func() {
 		defer receiptsSub.Unsubscribe()
@@ -381,6 +385,11 @@ func (api *FilterAPI) TransactionReceipts(ctx context.Context, filter *Transacti
 							receiptWithTx.Transaction,
 							int(receiptWithTx.Receipt.TransactionIndex),
 						)
+						// The removed field is only exposed when the client
+						// opted in; otherwise the original response is kept.
+						if includeRemoved {
+							marshaledReceipts[i]["removed"] = receiptWithTx.Removed
+						}
 					}
 
 					// Send a batch of tx receipts in one notification

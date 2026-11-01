@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -179,17 +180,19 @@ const (
 )
 
 type subscription struct {
-	id        rpc.ID
-	typ       Type
-	created   time.Time
-	logsCrit  ethereum.FilterQuery
-	logs      chan []*types.Log
-	txs       chan []*types.Transaction
-	headers   chan *types.Header
-	receipts  chan []*ReceiptWithTx
-	txHashes  map[common.Hash]struct{} // contains transaction hashes for transactionReceipts subscription filtering
-	installed chan struct{}            // closed when the filter is installed
-	err       chan error               // closed when the filter is uninstalled
+	id             rpc.ID
+	typ            Type
+	created        time.Time
+	logsCrit       ethereum.FilterQuery
+	logs           chan []*types.Log
+	txs            chan []*types.Transaction
+	headers        chan *types.Header
+	receipts       chan []*ReceiptWithTx
+	txHashes       map[common.Hash]struct{} // contains transaction hashes for transactionReceipts subscription filtering
+	includeRemoved bool                     // also deliver receipts of blocks dropped by chain reorgs
+	lastHead       *types.Header            // latest canonical head seen by a receipt subscription with includeRemoved
+	installed      chan struct{}            // closed when the filter is installed
+	err            chan error               // closed when the filter is uninstalled
 }
 
 // EventSystem creates subscriptions, processes events and broadcasts them to the
@@ -410,22 +413,33 @@ func (es *EventSystem) SubscribePendingTxs(txs chan []*types.Transaction) *Subsc
 // SubscribeTransactionReceipts creates a subscription that writes transaction receipts for
 // transactions when they are included in blocks. If txHashes is provided, only receipts
 // for those specific transaction hashes will be delivered.
-func (es *EventSystem) SubscribeTransactionReceipts(txHashes []common.Hash, receipts chan []*ReceiptWithTx) *Subscription {
+//
+// When includeRemoved is enabled, the subscription keeps track of the canonical
+// chain head and also reports receipts belonging to blocks that are dropped in
+// a chain reorg, marked as removed. Only chain changes happening after the
+// subscription is installed are reported, no historical receipts are sent.
+func (es *EventSystem) SubscribeTransactionReceipts(txHashes []common.Hash, includeRemoved bool, receipts chan []*ReceiptWithTx) *Subscription {
 	hashSet := make(map[common.Hash]struct{}, len(txHashes))
 	for _, h := range txHashes {
 		hashSet[h] = struct{}{}
 	}
 	sub := &subscription{
-		id:        rpc.NewID(),
-		typ:       TransactionReceiptsSubscription,
-		created:   time.Now(),
-		logs:      make(chan []*types.Log),
-		txs:       make(chan []*types.Transaction),
-		headers:   make(chan *types.Header),
-		receipts:  receipts,
-		txHashes:  hashSet,
-		installed: make(chan struct{}),
-		err:       make(chan error),
+		id:             rpc.NewID(),
+		typ:            TransactionReceiptsSubscription,
+		created:        time.Now(),
+		logs:           make(chan []*types.Log),
+		txs:            make(chan []*types.Transaction),
+		headers:        make(chan *types.Header),
+		receipts:       receipts,
+		txHashes:       hashSet,
+		includeRemoved: includeRemoved,
+		installed:      make(chan struct{}),
+		err:            make(chan error),
+	}
+	if includeRemoved {
+		// Mark the current head as the baseline; everything before it is
+		// considered history and is not sent to the subscriber.
+		sub.lastHead = es.backend.CurrentHeader()
 	}
 	return es.subscribe(sub)
 }
@@ -457,11 +471,143 @@ func (es *EventSystem) handleChainEvent(filters filterIndex, ev core.ChainEvent)
 
 	// Handle transaction receipts subscriptions when a new block is added
 	for _, f := range filters[TransactionReceiptsSubscription] {
+		if f.includeRemoved {
+			es.handleTransactionReceipts(f, ev)
+			continue
+		}
 		matchedReceipts := filterReceipts(f.txHashes, ev)
 		if len(matchedReceipts) > 0 {
 			f.receipts <- matchedReceipts
 		}
 	}
+}
+
+// handleTransactionReceipts delivers the receipts of a newly canonized block
+// to a transactionReceipts subscription with includeRemoved enabled. If the
+// block does not extend the previously seen canonical head, the diverging
+// sections of the old and the new chain are reported separately: receipts of
+// blocks leaving the canonical chain are sent first, from the highest block
+// number to the lowest, marked as removed; receipts of the blocks entering
+// the canonical chain follow from the lowest block number to the highest,
+// marked as active. One notification is sent per block (only when the block
+// contains matching receipts), transactions keep their in-block order.
+func (es *EventSystem) handleTransactionReceipts(f *subscription, ev core.ChainEvent) {
+	ctx := context.Background()
+	newHead := ev.Header
+	lastHead := f.lastHead
+
+	// Common case: the new block extends the canonical head by one.
+	if lastHead == nil ||
+		(newHead.Number.Uint64() == lastHead.Number.Uint64()+1 && newHead.ParentHash == lastHead.Hash()) {
+		es.deliverBlockReceipts(f, ev.Receipts, ev.Transactions, false)
+		f.lastHead = newHead
+		return
+	}
+
+	// A reorg happened. Walk back both chains to the common ancestor. The
+	// headers are collected head-first (highest block number first).
+	var (
+		oldHeaders []*types.Header
+		newHeaders []*types.Header
+		oldHead    = lastHead
+		newSide    = newHead
+		failed     bool
+		parent     = func(h *types.Header) *types.Header {
+			parent, err := es.backend.HeaderByHash(ctx, h.ParentHash)
+			if err != nil {
+				log.Warn("Failed to retrieve parent header for receipt reorg", "number", h.Number, "hash", h.Hash(), "parent", h.ParentHash, "err", err)
+				failed = true
+				return nil
+			}
+			if parent == nil {
+				log.Warn("Missing parent header for receipt reorg", "number", h.Number, "hash", h.Hash(), "parent", h.ParentHash)
+				failed = true
+			}
+			return parent
+		}
+	)
+	for oldHead.Number.Uint64() > newSide.Number.Uint64() {
+		oldHeaders = append(oldHeaders, oldHead)
+		if oldHead = parent(oldHead); oldHead == nil {
+			break
+		}
+	}
+	if oldHead != nil {
+		for newSide.Number.Uint64() > oldHead.Number.Uint64() {
+			newHeaders = append(newHeaders, newSide)
+			if newSide = parent(newSide); newSide == nil {
+				break
+			}
+		}
+	}
+	for !failed && oldHead != nil && newSide != nil && oldHead.Hash() != newSide.Hash() {
+		oldHeaders = append(oldHeaders, oldHead)
+		newHeaders = append(newHeaders, newSide)
+		oldHead = parent(oldHead)
+		newSide = parent(newSide)
+	}
+	if failed || oldHead == nil || newSide == nil || oldHead.Hash() != newSide.Hash() {
+		// The reorg sections could not be reconstructed; fall back to
+		// reporting only the new block instead of sending bogus removals.
+		log.Warn("Failed to reconstruct chain reorg for receipt subscription, skipping removed receipts", "old", lastHead.Hash(), "new", newHead.Hash())
+		es.deliverBlockReceipts(f, ev.Receipts, ev.Transactions, false)
+		f.lastHead = newHead
+		return
+	}
+
+	// Report the blocks leaving the canonical chain, high numbers first.
+	for _, header := range oldHeaders {
+		receipts, txs, err := es.blockReceiptsAndTxs(ctx, header)
+		if err != nil {
+			log.Warn("Failed to retrieve removed block receipts", "number", header.Number, "hash", header.Hash(), "err", err)
+			continue
+		}
+		es.deliverBlockReceipts(f, receipts, txs, true)
+	}
+
+	// Report the blocks entering the canonical chain, low numbers first.
+	slices.Reverse(newHeaders)
+	for _, header := range newHeaders {
+		if header.Hash() == newHead.Hash() {
+			// The head block data comes with the event.
+			es.deliverBlockReceipts(f, ev.Receipts, ev.Transactions, false)
+			continue
+		}
+		receipts, txs, err := es.blockReceiptsAndTxs(ctx, header)
+		if err != nil {
+			log.Warn("Failed to retrieve added block receipts", "number", header.Number, "hash", header.Hash(), "err", err)
+			continue
+		}
+		es.deliverBlockReceipts(f, receipts, txs, false)
+	}
+	f.lastHead = newHead
+}
+
+// deliverBlockReceipts filters the receipts of a single block according to the
+// subscription criteria and sends them as one block batch.
+func (es *EventSystem) deliverBlockReceipts(f *subscription, receipts types.Receipts, txs types.Transactions, removed bool) {
+	matched := filterBlockReceipts(f.txHashes, receipts, txs, removed)
+	if len(matched) > 0 {
+		f.receipts <- matched
+	}
+}
+
+// blockReceiptsAndTxs retrieves the receipts and transactions of the block
+// referenced by header.
+func (es *EventSystem) blockReceiptsAndTxs(ctx context.Context, header *types.Header) (types.Receipts, types.Transactions, error) {
+	hash := header.Hash()
+	body, err := es.backend.GetBody(ctx, hash, rpc.BlockNumber(header.Number.Uint64()))
+	if err != nil {
+		return nil, nil, err
+	}
+	receipts, err := es.backend.GetReceipts(ctx, hash)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(receipts) != len(body.Transactions) {
+		return nil, nil, fmt.Errorf("receipts and transactions length mismatch, receipts %d, transactions %d", len(receipts), len(body.Transactions))
+	}
+	return receipts, body.Transactions, nil
 }
 
 // eventLoop (un)installs filters and processes mux events.

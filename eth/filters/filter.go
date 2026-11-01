@@ -565,6 +565,9 @@ func bloomFilter(bloom types.Bloom, addresses []common.Address, topics [][]commo
 type ReceiptWithTx struct {
 	Receipt     *types.Receipt
 	Transaction *types.Transaction
+	// Removed indicates whether the block containing the transaction has been
+	// dropped from the canonical chain by a reorg.
+	Removed bool
 }
 
 // filterReceipts returns the receipts matching the given criteria
@@ -572,10 +575,15 @@ type ReceiptWithTx struct {
 // This is because receipts only contain low-level data, while user-facing data
 // may require additional information from the Transaction.
 func filterReceipts(txHashes map[common.Hash]struct{}, ev core.ChainEvent) []*ReceiptWithTx {
-	var ret []*ReceiptWithTx
+	return filterBlockReceipts(txHashes, ev.Receipts, ev.Transactions, false)
+}
 
-	receipts := ev.Receipts
-	txs := ev.Transactions
+// filterBlockReceipts returns the receipts matching the given transaction hash
+// filter from a single block, preserving the original transaction order. The
+// removed flag is assigned to every returned entry and marks receipts of blocks
+// that have been dropped from the canonical chain by a reorg.
+func filterBlockReceipts(txHashes map[common.Hash]struct{}, receipts types.Receipts, txs types.Transactions, removed bool) []*ReceiptWithTx {
+	var ret []*ReceiptWithTx
 
 	if len(receipts) != len(txs) {
 		log.Warn("Receipts and transactions length mismatch", "receipts", len(receipts), "transactions", len(txs))
@@ -589,6 +597,7 @@ func filterReceipts(txHashes map[common.Hash]struct{}, ev core.ChainEvent) []*Re
 			ret[i] = &ReceiptWithTx{
 				Receipt:     receipt,
 				Transaction: txs[i],
+				Removed:     removed,
 			}
 		}
 	} else {
@@ -597,6 +606,7 @@ func filterReceipts(txHashes map[common.Hash]struct{}, ev core.ChainEvent) []*Re
 				ret = append(ret, &ReceiptWithTx{
 					Receipt:     receipt,
 					Transaction: txs[i],
+					Removed:     removed,
 				})
 
 				// Early exit if all receipts are found

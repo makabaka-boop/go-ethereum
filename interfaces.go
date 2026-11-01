@@ -67,8 +67,14 @@ type ChainReader interface {
 // TransactionReceiptsQuery defines criteria for transaction receipts subscription.
 // If TransactionHashes is empty, receipts for all transactions included in new blocks will be delivered.
 // Otherwise, only receipts for the specified transactions will be delivered.
+//
+// IncludeRemoved is disabled by default. When enabled, receipts of blocks that
+// leave the canonical chain during a reorg are delivered as well, marked with
+// the removed field set to true, followed by the receipts of the new canonical
+// blocks marked as false.
 type TransactionReceiptsQuery struct {
-	TransactionHashes []common.Hash
+	TransactionHashes []common.Hash `json:"transactionHashes"`
+	IncludeRemoved    bool          `json:"includeRemoved"`
 }
 
 // TransactionReader provides access to past transactions and their receipts.

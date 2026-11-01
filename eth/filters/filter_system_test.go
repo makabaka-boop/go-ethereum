@@ -18,6 +18,7 @@ package filters
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math/big"
 	"reflect"
@@ -881,7 +882,7 @@ func TestTransactionReceiptsSubscription(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			receiptsChan := make(chan []*ReceiptWithTx)
-			sub := api.events.SubscribeTransactionReceipts(tc.filterTxHashes, receiptsChan)
+			sub := api.events.SubscribeTransactionReceipts(tc.filterTxHashes, false, receiptsChan)
 
 			// Send chain event
 			backend.chainFeed.Send(chainEvent)
@@ -926,5 +927,284 @@ func TestTransactionReceiptsSubscription(t *testing.T) {
 			sub.Unsubscribe()
 			<-sub.Err()
 		})
+	}
+}
+
+// TestTransactionReceiptsQueryUnmarshal checks the parsing of the
+// transactionReceipts subscription parameters, including the default-off
+// includeRemoved option.
+func TestTransactionReceiptsQueryUnmarshal(t *testing.T) {
+	t.Parallel()
+
+	hash := common.HexToHash("0x0101010101010101010101010101010101010101010101010101010101010101")
+	cases := []struct {
+		data        string
+		wantHashes  []common.Hash
+		wantRemoved bool
+	}{
+		{`{}`, nil, false},
+		{`{"includeRemoved":false}`, nil, false},
+		{`{"includeRemoved":true}`, nil, true},
+		{`{"transactionHashes":["0x0101010101010101010101010101010101010101010101010101010101010101"],"includeRemoved":true}`, []common.Hash{hash}, true},
+	}
+	for _, tc := range cases {
+		var args TransactionReceiptsQuery
+		if err := json.Unmarshal([]byte(tc.data), &args); err != nil {
+			t.Fatalf("failed to unmarshal %q: %v", tc.data, err)
+		}
+		if args.IncludeRemoved != tc.wantRemoved {
+			t.Errorf("input %q: includeRemoved mismatch, want %v, got %v", tc.data, tc.wantRemoved, args.IncludeRemoved)
+		}
+		if len(args.TransactionHashes) != len(tc.wantHashes) {
+			t.Errorf("input %q: expected %d hashes, got %d", tc.data, len(tc.wantHashes), len(args.TransactionHashes))
+			continue
+		}
+		for i, want := range tc.wantHashes {
+			if args.TransactionHashes[i] != want {
+				t.Errorf("input %q: hash %d mismatch", tc.data, i)
+			}
+		}
+	}
+}
+
+// TestTransactionReceiptsSubscriptionIncludeRemoved verifies that a
+// transactionReceipts subscription with includeRemoved enabled reports the
+// receipts of blocks dropped by a chain reorg (marked removed, high block
+// numbers first) followed by the receipts of the new canonical blocks
+// (marked active, low block numbers first), one batch per block.
+func TestTransactionReceiptsSubscriptionIncludeRemoved(t *testing.T) {
+	t.Parallel()
+
+	var (
+		db           = rawdb.NewMemoryDatabase()
+		backend, sys = newTestFilterSystem(db, Config{})
+		api          = NewFilterAPI(sys)
+		key1, _      = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+		addr1        = crypto.PubkeyToAddress(key1.PublicKey)
+		signer       = types.NewLondonSigner(big.NewInt(1))
+		genesis      = &core.Genesis{
+			Alloc:   types.GenesisAlloc{addr1: {Balance: big.NewInt(1000000000000000000)}},
+			Config:  params.TestChainConfig,
+			BaseFee: big.NewInt(params.InitialBaseFee),
+		}
+	)
+	// Build a plain transfer transaction with the given nonce and value.
+	newTx := func(nonce uint64, value int64) *types.Transaction {
+		toAddr := common.HexToAddress("0xb794f5ea0ba39494ce83a213fffba74279579268")
+		tx, err := types.SignTx(types.NewTx(&types.LegacyTx{
+			Nonce:    nonce,
+			GasPrice: big.NewInt(params.InitialBaseFee),
+			Gas:      21000,
+			To:       &toAddr,
+			Value:    big.NewInt(value),
+		}), signer, key1)
+		if err != nil {
+			t.Fatalf("failed to sign tx: %v", err)
+		}
+		return tx
+	}
+
+	// Two competing forks share the transaction at nonce 0; the rest of the
+	// transactions differ between the branches.
+	var (
+		sharedTx = newTx(0, 1000)
+
+		a1Txs = []*types.Transaction{sharedTx, newTx(1, 2001), newTx(2, 2002), newTx(3, 2003), newTx(4, 2004)}
+		a2Txs = []*types.Transaction{newTx(5, 2005), newTx(6, 2006)}
+
+		b1Txs = []*types.Transaction{sharedTx, newTx(1, 3001), newTx(2, 3002), newTx(3, 3003), newTx(4, 3004)}
+		b2Txs = []*types.Transaction{newTx(5, 4005), newTx(6, 4006)}
+	)
+	// Generate the old canonical chain (A) and the competing chain (B).
+	_, chainA, _ := core.GenerateChainWithGenesis(genesis, ethash.NewFaker(), 2, func(i int, gen *core.BlockGen) {
+		for _, tx := range [][]*types.Transaction{a1Txs, a2Txs}[i] {
+			gen.AddTx(tx)
+		}
+	})
+	_, chainB, _ := core.GenerateChainWithGenesis(genesis, ethash.NewFaker(), 2, func(i int, gen *core.BlockGen) {
+		for _, tx := range [][]*types.Transaction{b1Txs, b2Txs}[i] {
+			gen.AddTx(tx)
+		}
+	})
+
+	blockchain, err := core.NewBlockChain(db, genesis, ethash.NewFaker(), nil)
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	if n, err := blockchain.InsertChain(chainA); err != nil {
+		t.Fatalf("block %d: failed to insert chain A: %v", n, err)
+	}
+
+	const chanBuffer = 16
+	var (
+		allCh    = make(chan []*ReceiptWithTx, chanBuffer)
+		filterCh = make(chan []*ReceiptWithTx, chanBuffer)
+		sharedCh = make(chan []*ReceiptWithTx, chanBuffer)
+		noneCh   = make(chan []*ReceiptWithTx, chanBuffer)
+		legacyCh = make(chan []*ReceiptWithTx, chanBuffer)
+	)
+	// Subscriptions are installed on top of chain A, so no historical
+	// receipts are expected.
+	allSub := api.events.SubscribeTransactionReceipts(nil, true, allCh)
+	filterHashes := []common.Hash{a2Txs[0].Hash(), a1Txs[2].Hash(), b1Txs[3].Hash(), b2Txs[1].Hash()}
+	filterSub := api.events.SubscribeTransactionReceipts(filterHashes, true, filterCh)
+	sharedSub := api.events.SubscribeTransactionReceipts([]common.Hash{sharedTx.Hash()}, true, sharedCh)
+	noneSub := api.events.SubscribeTransactionReceipts([]common.Hash{{0x01}}, true, noneCh)
+	legacySub := api.events.SubscribeTransactionReceipts(nil, false, legacyCh)
+
+	// Sanity check: nothing is delivered before chain changes happen.
+	select {
+	case rwt := <-allCh:
+		t.Fatalf("unexpected historical receipts: %d", len(rwt))
+	default:
+	}
+
+	// Switch the canonical chain to B and replay the chain events in the same
+	// order core emits them (one event per block, low to high).
+	if n, err := blockchain.InsertChain(chainB); err != nil {
+		t.Fatalf("block %d: failed to insert chain B: %v", n, err)
+	}
+	sendEvent := func(block *types.Block) {
+		backend.chainFeed.Send(core.ChainEvent{
+			Header:       block.Header(),
+			Receipts:     blockchain.GetReceiptsByHash(block.Hash()),
+			Transactions: block.Transactions(),
+		})
+	}
+	sendEvent(chainB[0])
+	sendEvent(chainB[1])
+
+	// drain collects the given number of batches from the channel, failing on
+	// timeout.
+	drain := func(ch <-chan []*ReceiptWithTx, count int) [][]*ReceiptWithTx {
+		batches := make([][]*ReceiptWithTx, 0, count)
+		timeout := time.After(2 * time.Second)
+		for len(batches) < count {
+			select {
+			case batch := <-ch:
+				batches = append(batches, batch)
+			case <-timeout:
+				t.Fatalf("timeout waiting for batch %d/%d", len(batches)+1, count)
+			}
+		}
+		return batches
+	}
+	// expectEmpty asserts that no receipt is delivered on the channel.
+	expectEmpty := func(ch <-chan []*ReceiptWithTx) {
+		select {
+		case batch := <-ch:
+			t.Fatalf("unexpected receipts: %d", len(batch))
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	// The unfiltered subscription receives, in order: A2 removed, A1
+	// removed, B1 active, B2 active.
+	wantBatches := []struct {
+		block   *types.Block
+		txs     []*types.Transaction
+		removed bool
+	}{
+		{chainA[1], a2Txs, true},
+		{chainA[0], a1Txs, true},
+		{chainB[0], b1Txs, false},
+		{chainB[1], b2Txs, false},
+	}
+	batches := drain(allCh, len(wantBatches))
+	for i, want := range wantBatches {
+		if len(batches[i]) != len(want.txs) {
+			t.Fatalf("batch %d: expected %d receipts, got %d", i, len(want.txs), len(batches[i]))
+		}
+		for j, rwt := range batches[i] {
+			if rwt.Removed != want.removed {
+				t.Errorf("batch %d receipt %d: expected removed=%v, got %v", i, j, want.removed, rwt.Removed)
+			}
+			if rwt.Receipt.TxHash != want.txs[j].Hash() {
+				t.Errorf("batch %d receipt %d: tx order mismatch, want %x, got %x", i, j, want.txs[j].Hash(), rwt.Receipt.TxHash)
+			}
+			// The receipt keeps the block it belongs to.
+			if rwt.Receipt.BlockHash != want.block.Hash() {
+				t.Errorf("batch %d receipt %d: block hash mismatch, want %x, got %x", i, j, want.block.Hash(), rwt.Receipt.BlockHash)
+			}
+			if rwt.Receipt.BlockNumber.Uint64() != want.block.NumberU64() {
+				t.Errorf("batch %d receipt %d: block number mismatch, want %d, got %d", i, j, want.block.NumberU64(), rwt.Receipt.BlockNumber.Uint64())
+			}
+		}
+	}
+	expectEmpty(allCh)
+
+	// Hash filtering is preserved per block and no-match blocks produce no
+	// notification.
+	filterWant := []struct {
+		tx      *types.Transaction
+		block   *types.Block
+		removed bool
+	}{
+		{a2Txs[0], chainA[1], true},
+		{a1Txs[2], chainA[0], true},
+		{b1Txs[3], chainB[0], false},
+		{b2Txs[1], chainB[1], false},
+	}
+	filtered := drain(filterCh, len(filterWant))
+	for i, want := range filterWant {
+		if len(filtered[i]) != 1 {
+			t.Fatalf("filtered batch %d: expected 1 receipt, got %d", i, len(filtered[i]))
+		}
+		rwt := filtered[i][0]
+		if rwt.Receipt.TxHash != want.tx.Hash() || rwt.Removed != want.removed || rwt.Receipt.BlockHash != want.block.Hash() {
+			t.Errorf("filtered batch %d mismatch: tx %x/%v block %x, got tx %x/%v block %x", i,
+				want.tx.Hash(), want.removed, want.block.Hash(),
+				rwt.Receipt.TxHash, rwt.Removed, rwt.Receipt.BlockHash)
+		}
+	}
+	expectEmpty(filterCh)
+
+	// The shared transaction leaves chain A and re-enters on chain B: both a
+	// removed and a fresh active receipt are delivered with their respective
+	// block information.
+	shared := drain(sharedCh, 2)
+	for i, want := range []struct {
+		block   *types.Block
+		removed bool
+	}{{chainA[0], true}, {chainB[0], false}} {
+		if len(shared[i]) != 1 || shared[i][0].Receipt.TxHash != sharedTx.Hash() {
+			t.Fatalf("shared batch %d: unexpected receipts %v", i, shared[i])
+		}
+		rwt := shared[i][0]
+		if rwt.Removed != want.removed || rwt.Receipt.BlockHash != want.block.Hash() {
+			t.Errorf("shared batch %d: want removed=%v block %x, got removed=%v block %x", i,
+				want.removed, want.block.Hash(), rwt.Removed, rwt.Receipt.BlockHash)
+		}
+	}
+	expectEmpty(sharedCh)
+
+	// A subscription without matching receipts never gets notified, not even
+	// during a reorg.
+	expectEmpty(noneCh)
+
+	// Without the option the behavior is unchanged: only receipts of the new
+	// canonical blocks are delivered, nothing is marked removed.
+	legacy := drain(legacyCh, 2)
+	for i, want := range []struct {
+		block *types.Block
+		txs   []*types.Transaction
+	}{{chainB[0], b1Txs}, {chainB[1], b2Txs}} {
+		if len(legacy[i]) != len(want.txs) {
+			t.Fatalf("legacy batch %d: expected %d receipts, got %d", i, len(want.txs), len(legacy[i]))
+		}
+		for j, rwt := range legacy[i] {
+			if rwt.Removed {
+				t.Errorf("legacy batch %d receipt %d: unexpectedly marked removed", i, j)
+			}
+			if rwt.Receipt.BlockHash != want.block.Hash() || rwt.Receipt.TxHash != want.txs[j].Hash() {
+				t.Errorf("legacy batch %d receipt %d: wrong block/tx", i, j)
+			}
+		}
+	}
+	expectEmpty(legacyCh)
+
+	for _, sub := range []*Subscription{allSub, filterSub, sharedSub, noneSub, legacySub} {
+		sub.Unsubscribe()
+		<-sub.Err()
 	}
 }
