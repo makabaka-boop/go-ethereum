@@ -17,9 +17,11 @@
 package native
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"math/big"
+	"sort"
 	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -48,6 +50,18 @@ type callLog struct {
 	Position hexutil.Uint `json:"position"`
 }
 
+// callStorageChange is the net SSTORE change recorded for a call frame,
+// aggregated over the frame itself and all of its non-reverted subcalls.
+// Address is the account whose storage was modified (which differs from the
+// callee for DELEGATECALL), Slot the storage key, Before the slot value at
+// frame entry and After the slot value at frame exit.
+type callStorageChange struct {
+	Address common.Address `json:"address"`
+	Slot    common.Hash    `json:"slot"`
+	Before  common.Hash    `json:"before"`
+	After   common.Hash    `json:"after"`
+}
+
 type callFrame struct {
 	Type         vm.OpCode       `json:"-"`
 	From         common.Address  `json:"from"`
@@ -60,6 +74,10 @@ type callFrame struct {
 	RevertReason string          `json:"revertReason,omitempty"`
 	Calls        []callFrame     `json:"calls,omitempty" rlp:"optional"`
 	Logs         []callLog       `json:"logs,omitempty" rlp:"optional"`
+	// StorageChanges contains the net storage writes of the frame, including
+	// the aggregated effect of non-reverted subcalls. Only populated when
+	// the tracer is configured with withStorageChanges.
+	StorageChanges []callStorageChange `json:"storageChanges,omitempty" rlp:"optional"`
 	// Placed at end on purpose. The RLP will be decoded to 0 instead of
 	// nil if there are non-empty elements after in the struct.
 	Value            *big.Int `json:"value,omitempty" rlp:"optional"`
@@ -116,13 +134,31 @@ type callTracer struct {
 	config    callTracerConfig
 	gasLimit  uint64
 	depth     int
-	interrupt atomic.Bool           // Atomic flag to signal execution interruption
-	reason    atomic.Pointer[error] // Reason for the interruption, populated by Stop
+	// storageChanges holds the net storage writes tracked per open call frame,
+	// in lockstep with callstack. It is only populated when WithStorageChanges
+	// is enabled.
+	storageChanges []map[storageSlot]*storageDelta
+	interrupt      atomic.Bool           // Atomic flag to signal execution interruption
+	reason         atomic.Pointer[error] // Reason for the interruption, populated by Stop
+}
+
+// storageSlot identifies a storage slot of an account.
+type storageSlot struct {
+	address common.Address
+	slot    common.Hash
+}
+
+// storageDelta tracks the value of a slot at frame entry (before) and its
+// latest value (after).
+type storageDelta struct {
+	before common.Hash
+	after  common.Hash
 }
 
 type callTracerConfig struct {
-	OnlyTopCall bool `json:"onlyTopCall"` // If true, call tracer won't collect any subcalls
-	WithLog     bool `json:"withLog"`     // If true, call tracer will collect event logs
+	OnlyTopCall        bool `json:"onlyTopCall"`        // If true, call tracer won't collect any subcalls
+	WithLog            bool `json:"withLog"`            // If true, call tracer will collect event logs
+	WithStorageChanges bool `json:"withStorageChanges"` // If true, call tracer will collect net storage changes
 }
 
 // newCallTracer returns a native go tracer which tracks
@@ -132,14 +168,23 @@ func newCallTracer(ctx *tracers.Context, cfg json.RawMessage, chainConfig *param
 	if err != nil {
 		return nil, err
 	}
+	hooks := &tracing.Hooks{
+		OnTxStart: t.OnTxStart,
+		OnTxEnd:   t.OnTxEnd,
+		OnEnter:   t.OnEnter,
+		OnExit:    t.OnExit,
+		OnLog:     t.OnLog,
+	}
+	if t.config.WithStorageChanges {
+		hooks.OnStorageChange = t.OnStorageChange
+		// Wrap the hooks with a journal so that storage writes of reverted
+		// frames are replayed with their reverse values before the frame exits.
+		if hooks, err = tracing.WrapWithJournal(hooks); err != nil {
+			return nil, err
+		}
+	}
 	return &tracers.Tracer{
-		Hooks: &tracing.Hooks{
-			OnTxStart: t.OnTxStart,
-			OnTxEnd:   t.OnTxEnd,
-			OnEnter:   t.OnEnter,
-			OnExit:    t.OnExit,
-			OnLog:     t.OnLog,
-		},
+		Hooks:     hooks,
 		GetResult: t.GetResult,
 		Stop:      t.Stop,
 	}, nil
@@ -179,6 +224,9 @@ func (t *callTracer) OnEnter(depth int, typ byte, from common.Address, to common
 		call.Gas = t.gasLimit
 	}
 	t.callstack = append(t.callstack, call)
+	if t.config.WithStorageChanges {
+		t.storageChanges = append(t.storageChanges, nil)
+	}
 }
 
 // OnExit is called when EVM exits a scope, even if the scope didn't
@@ -205,6 +253,9 @@ func (t *callTracer) OnExit(depth int, output []byte, gasUsed uint64, err error,
 
 	call.GasUsed = gasUsed
 	call.processOutput(output, err, reverted)
+	if t.config.WithStorageChanges {
+		t.finishStorageChanges(&call, reverted)
+	}
 	// Nest call into parent.
 	t.callstack[size-1].Calls = append(t.callstack[size-1].Calls, call)
 }
@@ -214,6 +265,113 @@ func (t *callTracer) captureEnd(output []byte, gasUsed uint64, err error, revert
 		return
 	}
 	t.callstack[0].processOutput(output, err, reverted)
+	if t.config.WithStorageChanges && len(t.storageChanges) == 1 {
+		if reverted {
+			// The top-level frame reverted, so no storage write survives,
+			// not even ones made by subcalls which had already succeeded.
+			clearStorageChanges(&t.callstack[0])
+		} else {
+			t.callstack[0].StorageChanges = sortedStorageChanges(t.storageChanges[0])
+		}
+		t.storageChanges = t.storageChanges[:0]
+	}
+}
+
+// OnStorageChange is invoked for every storage slot write. The tracer hooks
+// are wrapped with a tracing journal, which replays the writes with reverse
+// values when a frame reverts before OnExit is called.
+func (t *callTracer) OnStorageChange(addr common.Address, slot, prev, new common.Hash) {
+	if t.interrupt.Load() || len(t.storageChanges) == 0 {
+		return
+	}
+	idx := len(t.storageChanges) - 1
+	changes := t.storageChanges[idx]
+	if changes == nil {
+		changes = make(map[storageSlot]*storageDelta)
+		t.storageChanges[idx] = changes
+	}
+	key := storageSlot{address: addr, slot: slot}
+	if delta, ok := changes[key]; ok {
+		// A subsequent write (or a journal replay on revert) only updates
+		// the latest value, keeping the slot value at frame entry.
+		delta.after = new
+		return
+	}
+	changes[key] = &storageDelta{before: prev, after: new}
+}
+
+// finishStorageChanges consumes the storage deltas of the frame that is about
+// to be nested into its parent call frame.
+func (t *callTracer) finishStorageChanges(call *callFrame, reverted bool) {
+	if len(t.storageChanges) == 0 {
+		return
+	}
+	idx := len(t.storageChanges) - 1
+	changes := t.storageChanges[idx]
+	t.storageChanges = t.storageChanges[:idx]
+
+	if reverted {
+		// The frame reverted: none of its (or its descendants') storage
+		// writes survive. Discard the deltas and clear any change that was
+		// already attached to a nested non-reverted subcall.
+		clearStorageChanges(call)
+		return
+	}
+	call.StorageChanges = sortedStorageChanges(changes)
+	// Aggregate this frame's net effect into the parent frame.
+	if len(changes) == 0 || idx == 0 {
+		return
+	}
+	parent := t.storageChanges[idx-1]
+	if parent == nil {
+		parent = make(map[storageSlot]*storageDelta, len(changes))
+		t.storageChanges[idx-1] = parent
+	}
+	for key, delta := range changes {
+		if p, ok := parent[key]; ok {
+			p.after = delta.after
+		} else {
+			parent[key] = &storageDelta{before: delta.before, after: delta.after}
+		}
+	}
+}
+
+// sortedStorageChanges turns the tracked deltas into a deterministically
+// ordered list, dropping slots whose final value equals their value at frame
+// entry.
+func sortedStorageChanges(changes map[storageSlot]*storageDelta) []callStorageChange {
+	if len(changes) == 0 {
+		return nil
+	}
+	res := make([]callStorageChange, 0, len(changes))
+	for key, delta := range changes {
+		if delta.before == delta.after {
+			continue
+		}
+		res = append(res, callStorageChange{
+			Address: key.address,
+			Slot:    key.slot,
+			Before:  delta.before,
+			After:   delta.after,
+		})
+	}
+	sort.Slice(res, func(i, j int) bool {
+		if cmp := bytes.Compare(res[i].Address[:], res[j].Address[:]); cmp != 0 {
+			return cmp < 0
+		}
+		return bytes.Compare(res[i].Slot[:], res[j].Slot[:]) < 0
+	})
+	return res
+}
+
+// clearStorageChanges drops the recorded storage changes of a frame and all of
+// its nested subcalls. It is used when the frame itself or one of its
+// ancestors reverted.
+func clearStorageChanges(cf *callFrame) {
+	cf.StorageChanges = nil
+	for i := range cf.Calls {
+		clearStorageChanges(&cf.Calls[i])
+	}
 }
 
 func (t *callTracer) OnTxStart(env *tracing.VMContext, tx *types.Transaction, from common.Address) {
